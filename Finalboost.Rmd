@@ -1,0 +1,473 @@
+---
+title: "Kaggle competition"
+author: "Jun Jie Goh"
+date: "11/19/2021"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(gbm)
+library(rpart)
+library(rpart.plot)
+library(tidyr) 
+library(ggplot2)
+library(dplyr) 
+library(caret)
+library(ggcorrplot)
+library(car)
+library(skimr)
+library(leaps)
+library(glmnet)
+library(caTools)
+library(stringr)
+library(forcats)
+library(xgboost)
+```
+
+#loading data 
+```{r}
+df <- read.csv("analysisData.csv", stringsAsFactors=FALSE)
+scoringData = read.csv('scoringData.csv')
+```
+
+# Data cleaning 
+
+The first thing I did was to bind the two datasets together so that I can clean them simultaneously. Initially, I cleaned them separately but it was tedious and repetitive. Furthermore, when using xgboost on the scoringData, the columns required the same names and order. Hence, cleaning the data together would be the most pragmatic way of data mining for the two datasets.
+
+#bind data together to clean data simultaneously
+```{r}
+combinedf <- bind_rows(df, scoringData)
+```
+
+I removed columns that were not required for the analysis. I felt that these columns add no value to the model. 
+
+#remove unwanted columns
+```{r}
+drop <- c("name", "summary", "space", "description", "neighborhood_overview",
+"notes", "transit", "access", "interaction","house_rules", "host_name", "host_about", "host_location",
+"host_neighbourhood", "square_feet", "weekly_price", "monthly_price", "host_verifications", "host_has_profile_pic",
+"country_code", "smart_location", "country", "state", "street", "require_guest_profile_picutre", "jurisdiction_names",
+"calendar_updated")
+
+combinedf <- combinedf[,!(names(combinedf) %in% drop)]
+```
+
+
+
+When looking at the column 'property_type', some count of properties such as Tiny house had a count of lower than 30. I decided to regroup them into the level "other" 
+
+#Grouping unique stays and low counts into 'other'
+```{r}
+combinedf$property_type <- recode_factor(combinedf$property_type, Barn = "Other",
+                                  Boat = "Other",
+                                  Cabin = "Other",
+                                  'Camper/RV' = "Other",
+                                  Castle = "Other",
+                                  Cave = "Other",
+                                  Cottage = "Other",
+                                  'Dome house' = "Other",
+                                  'Earth house' = "Other",
+                                  Houseboat = "Other",
+                                  Island = "Other",
+                                  'Nature lodge' = "Other",
+                                  Tent = "Other",
+                                  Treehouse = "Other",
+                                  'Tiny house' = "Other",
+                                  Aparthotel = "Apartment",
+                                 'Casa particular (Cuba)' = "Other",
+                                  Lighthouse = "Other",
+                                 Timeshare = "Other")
+```
+
+After doing more exploring on the dataset, I realized that the column amenities could be useful in predicting an AirBnb price.The idea of the code below was to extract and create a new column for the amenities such as TV, wifi, and air conditioning. In addition, the grepl function returns true/false so I used as.interger to 'hot encode' the columns. Initially, I wanted to include a lot of amenities, however I realized that my RMSE did not improve or performed worse when I included the commented out code in this section. 
+
+After hot encoding the amenities, I dropped the original amenities column because I no longer needed it and it will not fit into the xgboost model. 
+
+#Use grepl to extract out amenities and create new column and then drop amenities column 
+```{r}
+combinedf$TV <- as.integer(grepl("TV", combinedf$amenities))
+combinedf$Wifi <- as.integer(grepl("Wifi", combinedf$amenities))
+combinedf$Aircon <- as.integer(grepl("Air conditioning", combinedf$amenities))
+combinedf$Kitchen <- as.integer(grepl("Kitchen", combinedf$amenities))
+combinedf$Heating <- as.integer(grepl("Heating", combinedf$amenities))
+combinedf$Gym <- as.integer(grepl("Gym", combinedf$amenities))
+combinedf$Washer <- as.integer(grepl("Washer", combinedf$amenities))
+combinedf$Dryer <- as.integer(grepl("Dryer", combinedf$amenities))
+combinedf$Parking <- as.integer(grepl("parking", combinedf$amenities))
+combinedf$Doorman <- as.integer(grepl("Doorman", combinedf$amenities))
+combinedf$Hotwater <- as.integer(grepl("Hot water", combinedf$amenities))
+combinedf$twentyfourhour <- as.integer(grepl("24-hour check-in", combinedf$amenities))
+#combinedf$Essentials <- as.integer(grepl("Essentials", combinedf$amenities))
+#combinedf$hottub <- as.integer(grepl("Hot tub", combinedf$amenities))
+#combinedf$elevator <- as.integer(grepl("Elevator", combinedf$amenities))
+#combinedf$pets <- as.integer(grepl("Pets allowed", combinedf$amenities))
+#combinedf$fireplace <- as.integer(grepl("Indoor foreplace", combinedf$amenities))
+#combinedf$cable <- as.integer(grepl("Cable TV", combinedf$amenities))
+
+
+drop1 <- c("amenities")
+combinedf <- combinedf[,!(names(combinedf) %in% drop1)]
+```
+
+
+
+The next thing I did was to look at the true/false columns. I wanted to change them to binary format (1 and 0). I realized this step was not necessary since the function data.matrix will convert them to numerical values when converting the data frame to a matrix. However, I still converted them regardless and anything that has a missing value I filled it with a 0. This approach is similar to the cancellation policy where I ranked them ordinally (flexible as 5 and super_strict_60 as 1).
+
+Looking at the date columns (host_since, first_review, and last_review), I converted them to a numerical feature. I took the date that I was working on the project and deducted it by the date columns to get a numerical value. 
+
+I removed percentage signs from host response and acceptance rate so that they will not affect calculations. Subsequently, I replaced missing values with the column mean for security_deposit, cleaning_fee, host_response_rate, and host_acceptance_rate. 
+
+
+```{r}
+#True false to 1 and 0 
+combinedf <- combinedf %>%
+  mutate(host_is_superhost = case_when(as.character(combinedf$host_is_superhost) == "t" ~ 1,
+                                      as.character(combinedf$host_is_superhost) == "f" ~ 0,
+                                       is.na(combinedf$host_is_superhost) ~ 0)) %>%
+  mutate(host_identity_verified = case_when(as.character(combinedf$host_identity_verified) == "t" ~ 1,
+                                       as.character(combinedf$host_identity_verified) == "f" ~ 0,
+                                       is.na(combinedf$host_identity_verified) ~ 0)) %>%
+  mutate(is_location_exact = case_when(as.character(combinedf$is_location_exact) == "t" ~ 1,
+                                       as.character(combinedf$is_location_exact) == "f" ~ 0,
+                                       is.na(combinedf$is_location_exact) ~ 0))
+#Current date minus dates 
+combinedf <- combinedf %>%
+  mutate(host_since = as.integer(as.Date("2021-11-15") - as.Date(combinedf$host_since))) %>%
+  mutate(first_review = as.integer(as.Date("2021-11-15") - as.Date(combinedf$first_review))) %>%
+  mutate(last_review = as.integer(as.Date("2021-11-15") - as.Date(combinedf$last_review))) 
+
+#Ordinal data
+combinedf <- combinedf %>%
+  mutate(cancellation_policy = case_when(combinedf$cancellation_policy == "flexible" ~ 5,
+                                         combinedf$cancellation_policy == "moderate" ~ 4,
+                                         combinedf$cancellation_policy == "strict_14_with_grace_period" ~ 3,
+                                         combinedf$cancellation_policy == "super_strict_30" ~ 2,
+                                         combinedf$cancellation_policy == "super_strict_60" ~ 1))
+
+#remove % from host response rate and host acceptance rate
+combinedf$host_response_rate <- gsub("%","",combinedf$host_response_rate, fixed = TRUE) %>%
+  as.numeric()
+combinedf$host_acceptance_rate <- gsub("%","",combinedf$host_acceptance_rate, fixed = TRUE)%>%
+  as.numeric()
+
+#Replacing missing values with mean
+combinedf$security_deposit[is.na(combinedf$security_deposit)] <- mean(combinedf$security_deposit, na.rm=TRUE)
+combinedf$cleaning_fee[is.na(combinedf$cleaning_fee)] <- mean(combinedf$cleaning_fee, na.rm=TRUE)
+combinedf$host_response_rate[is.na(combinedf$host_response_rate)] <- mean(combinedf$host_response_rate, na.rm=TRUE)
+combinedf$host_acceptance_rate[is.na(combinedf$host_acceptance_rate)] <- mean(combinedf$host_acceptance_rate, na.rm=TRUE)
+```
+
+
+When looking at the geographical features, I decided to use neighborhood, neighborhood_cleansed,  neighbourhood_grouped_cleansed, city, and zipcode as my features. For the neighbourhood and city columns, I removed all punctuation, internal spaces, and converted them to lower cases to standardize their format for analysis.  In addition, if the neigbourhood and city frequency does not occur more than 10 times, I will remove them from the analysis. 
+
+```{r}
+# clean neighbourhood and neighbourhood cleansed
+combinedf$neighbourhood<-gsub(",|-|\\n|\\)|\\(|/|\\.", " ",combinedf$neighbourhood) 
+combinedf$neighbourhood <- tolower(combinedf$neighbourhood)
+combinedf$neighbourhood <- str_trim(gsub("\\s+", " ", combinedf$neighbourhood))
+combinedf$neighbourhood <- fct_lump_min(combinedf$neighbourhood, min=10)
+combinedf$neighbourhood <- as.factor(combinedf$neighbourhood)
+
+combinedf$neighbourhood_cleansed<-gsub(",|-|\\n|\\)|\\(|/|\\.", " ",combinedf$neighbourhood_cleansed) 
+combinedf$neighbourhood_cleansed <- tolower(combinedf$neighbourhood_cleansed)
+combinedf$neighbourhood_cleansed <- str_trim(gsub("\\s+", " ", combinedf$neighbourhood_cleansed))
+combinedf$neighbourhood_cleansed <- fct_lump_min(combinedf$neighbourhood_cleansed, min=10)
+combinedf$neighbourhood_cleansed <- as.factor(combinedf$neighbourhood_cleansed)
+
+combinedf$neighbourhood_grouped_cleansed <- tolower(combinedf$neighbourhood_group_cleansed)
+combinedf$neighbourhood_grouped_cleansed <- as.factor(combinedf$neighbourhood_group_cleansed)
+
+combinedf$city<-gsub(",|-|\\n|\\)|\\(|/|\\.", " ",combinedf$city) 
+combinedf$city <- tolower(combinedf$city)
+combinedf$city <- str_trim(gsub("\\s+", " ", combinedf$city))
+combinedf$city <- fct_lump_min(combinedf$city, min=10)
+combinedf$city <- as.factor(combinedf$city)
+
+combinedf$zipcode <- gsub("[^\\d]", "", combinedf$zipcode, perl=TRUE)
+combinedf$zipcode <- substr(combinedf$zipcode, 1, 5)
+combinedf$zipcode[nchar(combinedf$zipcode)<5] <- NA_character_
+combinedf$zipcode <- as.factor(combinedf$zipcode)
+combinedf$zipcode <- fct_lump_min(combinedf$zipcode, min=5)
+```
+
+After cleaning my data, I split them back into my the original data and scoringData. They are differentiated by price. The scoring data does not contain any price column so they can be easily separated. 
+
+```{r}
+df <- combinedf[!is.na(combinedf$price),]
+scoringData <- combinedf[is.na(combinedf$price),]
+```
+
+
+
+#drop remainding missing values 
+```{r}
+#drop null values
+df <- df %>% drop_na()
+```
+
+
+
+#Test train split
+```{r}
+set.seed(1031)
+split = createDataPartition(y = df$price, 
+                            p = 0.7, 
+                            list = F, 
+                            groups = 100)
+
+train1 = df[split,]
+test1 = df[-split,]
+```
+
+
+
+# XGBoost model 
+
+Before building my model, I need to convert both my test/train split dataframes into a xgb.Matrix. I have removed the price column in the data argument while specify price for the label. 
+
+```{r}
+xgb_train = xgb.DMatrix(data =  data.matrix(subset(train1, select = -c(price) )), label =  data.matrix(subset(train1, select = c(price))) )
+
+xgb_test = xgb.DMatrix(data =  data.matrix(subset(test1, select = -c(price))), label =  data.matrix(subset(test1, select = c(price) )))
+```
+
+Build XGBoost on training data with 200 trees
+
+```{r}
+xgboost = xgboost(data=xgb_train, 
+                  #label = train1$price,
+                  nrounds=200,
+                  verbose = 0,
+                  early_stopping_rounds = 30)
+
+
+
+#pred train
+pred_train = predict(xgboost, 
+                    newdata=xgb_train)
+                                 
+rmse_train_xgboost = sqrt(mean((pred_train - train1$price)^2));rmse_train_xgboost
+```
+
+
+Predict on test set. Note here we are clearly overfitting the model. I am unsure of how to prevent overfitting at this stage. 
+```{r}
+#pred test
+pred = predict(xgboost, 
+               newdata=xgb_test)
+                                 
+                                 
+rmse_xgboost = sqrt(mean((pred - test1$price)^2)); rmse_xgboost
+```
+At this stage, I wanted to know if my model is correctly predicting results and if it is making sense, I decided to plot an importance matrix to see feature importance. We see that room_type, zipcode, cleaning_fee, neighbourhood_cleansed, and property_type has the largest influence on price. This makes sense because when looking at airbnbs, the room_type, geographical location and the type of property you stay in will have a large influence on price. For example, an entire apartment situated in Tribeca will definitely cost more than a single room located in the Bronx. As this was making sense to me, I decided to move on with this model. 
+
+```{r}
+importance_matrix <-xgb.importance(colnames(xgb_train), model = xgboost)
+xgb.plot.importance(importance_matrix)
+```
+# Tune Model
+
+I used k-fold cross validation to tune the parameter of my model. 
+```{r, results='hide'}
+param <- list(
+      booster = "gbtree"
+    , eta = 0.1
+    , max_depth = c(6,7,8,9)
+    , min_child_weight = c(1,2)
+    , subsample = 1
+    , objective = "reg:squarederror"
+    , eval_metric = "rmse"
+      )
+
+cv.nround = 1000
+cv.nfold = 5
+
+cv <- xgb.cv(data=xgb_train, params = param, nthread=6, 
+                nfold=cv.nfold, nrounds=cv.nround,
+                verbose = T,early_stopping_round = 20, maximize = F)
+
+
+```
+
+
+```{r}
+cvxgboost = xgboost(data=xgb_train, 
+                  params = param,
+                  nrounds=1000,
+                  verbose = 0,
+                  early_stopping_rounds = 20)
+
+cvxgboost$best_iteration
+
+
+#pred train
+cv_pred_train = predict(cvxgboost, 
+                    newdata=xgb_train)
+                                 
+rmse_train_cv_xgboost = sqrt(mean((pred_train - train1$price)^2));rmse_train_cv_xgboost
+```
+
+
+```{r}
+pred = predict(cvxgboost, 
+               newdata=xgb_test)
+                                 
+                                 
+rmse_xgboost = sqrt(mean((pred - test1$price)^2)); rmse_xgboost
+```
+
+
+
+# predict best model
+```{r}
+# pred123 = predict(cvxgboost,newdata= xgb.DMatrix(data.matrix(subset(scoringData, select = -c(price) ))))
+```
+
+# Submit file 
+```{r}
+#submissionFile = data.frame(id = scoringData$id, price = pred123)
+#write.csv(submissionFile, 'boosted.csv',row.names = F)
+```
+
+
+# Additional Discussion
+## Random Search for xgboost
+I tried to use a random search to tune my model. This method of tuning takes very long time and after comparing the results, the tuned random search model did not perform as well as the standard xgboost tune. This code was referenced from stackoverflow (link below). I thought it was very interesting becasue in addition to searching for the best parameters, this validation method also looks for the best seednumber that optimizes for the rmse. 
+
+https://stackoverflow.com/questions/35050846/xgboost-in-r-how-does-xgb-cv-pass-the-optimal-parameters-into-xgb-train 
+
+
+```{r}
+# best_param <- list()
+# best_seednumber <- 1234
+# best_rmse <- Inf
+# best_rmse_index <- 0
+# 
+# set.seed(123)
+# for (iter in 1:50) {
+#   param <- list(objective = "reg:squarederror",
+#                 eval_metric = "rmse",
+#                 max_depth = sample(6:10, 1),
+#                 eta = runif(1, .01, .3), # Learning rate, default: 0.3
+#                 subsample = runif(1, .6, .9),
+#                 colsample_bytree = runif(1, .5, .8), 
+#                 min_child_weight = sample(1:40, 1),
+#                 max_delta_step = sample(1:10, 1)
+#   )
+#   cv.nround <-  2000
+#   cv.nfold <-  5 # 5-fold cross-validation
+#   seed.number  <-  sample.int(10000, 1) # set seed for the cv
+#   set.seed(seed.number)
+#   mdcv <- xgb.cv(data = xgb_train, params = param,  
+#                  nfold = cv.nfold, nrounds = cv.nround,
+#                  verbose = F, early_stopping_rounds = 8, maximize = FALSE)
+# 
+#   min_rmse_index  <-  mdcv$best_iteration
+#   min_rmse <-  mdcv$evaluation_log[min_rmse_index]$test_rmse_mean
+# 
+#   if (min_rmse < best_rmse) {
+#     best_rmse <- min_rmse
+#     best_rmse_index <- min_rmse_index
+#     best_seednumber <- seed.number
+#     best_param <- param
+#   }
+# }
+
+# nround = best_rmse_index
+# set.seed(best_seednumber)
+# 
+# xgb_tuned <- xgboost(params = best_param,
+#                        data = xgb_train,
+#                        nrounds = nround,
+#                      verbose = F)
+#                        
+# 
+# #pred test
+# pred1 = predict(xgb_tuned, 
+#                newdata=xgb_test)
+#                                  
+#                                  
+# rmse_xgboost1 = sqrt(mean((pred1 - test1$price)^2)); rmse_xgboost1
+```
+
+
+
+# Attempt at RandomForest 
+
+Prior to using xgboost, I attempted building my model using a Random Forest model. Before building the model, I used Lasso to select my features. I did not use Lasso in xgboost because I realized that by adding more features into the model, my RMSE was constantly reducing. However, it did come at a cost as I overfitting my model and I dropped a few positions after prediction on the other 50% of scoringData. 
+
+
+```{r}
+# Lasso feature selection 
+# x = model.matrix(price~property_type + host_listings_count + accommodates + bedrooms + bathrooms
+#                  + security_deposit + cleaning_fee + extra_people + review_scores_rating
+#                  + review_scores_cleanliness + host_response_time + host_is_superhost
+#                  + host_has_profile_pic + property_type + bed_type + host_response_rate
+#                  + reviews_per_month + neighbourhood_group_cleansed, 
+#                  data = train)
+# 
+# y = train$price
+# 
+# lassoModel = glmnet(x,y, alpha=1) 
+# plot(lassoModel,xvar='lambda',label=T)
+# plot(lassoModel,xvar='dev',label=T)
+# set.seed(617)
+# cv.lasso = cv.glmnet(x,y,alpha=1) # 10-fold cross-validation
+# plot(cv.lasso)
+# coef(cv.lasso)
+# 
+# # build tree
+# tree = rpart(price~property_type + accommodates + bedrooms + bathrooms
+#              + security_deposit + cleaning_fee + extra_people + review_scores_rating
+#              + review_scores_cleanliness,data = train, method = 'anova')
+# 
+# pred_train = predict(tree)
+# rmse_train_tree = sqrt(mean((pred_train - train$price)^2)); rmse_train_tree
+# 
+# 
+# pred = predict(tree, newdata = test)
+# rmse_tree = sqrt(mean((pred - test$price)^2)); rmse_tree
+# 
+# # Tree Tuning
+# 
+# tuneGrid = expand.grid(cp = seq(0,0.1,0.0001))
+# 
+# trControl = trainControl(method = 'cv',number = 10)
+# set.seed(1031)
+# tree_cv = train(price~property_type + accommodates + bedrooms + bathrooms
+#              + security_deposit + cleaning_fee + extra_people + review_scores_rating
+#              + review_scores_cleanliness,
+#                data = train,
+#                method = 'rpart',
+#                trControl = trControl, 
+#                tuneGrid = tuneGrid)
+# 
+# tree_cv$bestTune
+# 
+# # rebuild tree with best tune
+# cvtree = rpart(price~ property_type + accommodates + bedrooms + bathrooms
+#              + security_deposit + cleaning_fee + extra_people + review_scores_rating
+#              + review_scores_cleanliness, 
+#                data = train, 
+#                method = 'anova', 
+#                cp = tree_cv$bestTune)
+# 
+# pred_train = predict(cvtree)
+# rmse_train_cv_tree = sqrt(mean((pred_train - train$price)^2)); rmse_train_cv_tree
+```
+
+# Model RMSE comparisons and final thoughts 
+
+ Model                        | RMSE on training data | RMSE on test data |  RMSE after CV(test)| RMSE on Kaggle |          
+|-----------------------------|-----------------------|-------------------|---------------------|----------------|
+| Model 1: Random Forest      |        86.23          |      86.6         |        71.21        |    77.31       |       
+| Model 2: xgboost            |      29.07652         |      60.71        |        59.28523     |    65.33       |   
+
+
+After testing the two different models, it is clear that XGBoost had a lower RMSE and I went ahead to submit with that model. If I had additional time to work on the project, I will do more data cleaning/mining and perhaps try to do sentiment analysis for the Airbnb description. 
+
+
+
+
